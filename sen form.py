@@ -44,7 +44,7 @@ class PositionalEncoding(tf.keras.layers.Layer):
 GESTURES             = ["hello", "thanks", "yes", "no", "i", "fine", "please", "sorry"]
 SEQUENCE_LENGTH      = 30
 INPUT_SIZE           = 150
-CONFIDENCE_THRESHOLD = 0.80
+CONFIDENCE_THRESHOLD = 0.92
 ENTROPY_THRESHOLD    = 1.8
 STABLE_FRAMES        = 8
 COOLDOWN_SECONDS     = 2.5
@@ -156,11 +156,8 @@ def extract_keypoints(hr, pr, fr):
                         for i in FACE_LANDMARKS]).flatten() \
               if fl else np.zeros(len(FACE_LANDMARKS) * 3)
     kp = np.concatenate([hand_kp, pose_kp, face_kp])
-
-    if np.max(kp) != 0:
-        kp = kp - np.mean(kp)
-        kp = kp / (np.std(kp) + 1e-6)
-
+    if np.isnan(kp).any() or np.isinf(kp).any():
+        kp = np.zeros_like(kp)
     return kp
 
 def calc_entropy(probs):
@@ -207,6 +204,7 @@ def make_sentence(words):
         ("sorry", "yes")        : "Yes, sorry.",
         ("sorry", "no")         : "No, sorry.",
         ("yes", "i", "fine")    : "Yes, I am fine.",
+        ("no", "i", "fine")    : "No, I am not fine.",
     }
     k = tuple(w.lower() for w in words)
     if k in fixes:
@@ -420,8 +418,8 @@ while True:
                 confirmed = stable_buf[0]
                 now = time.time()
 
-                # cooldown prevents same word repeating too fast
-                if not (confirmed == last_word and now - last_time < COOLDOWN_SECONDS):
+                # cooldown prevents same word repeating too fast, and prevent duplicates entirely
+                if not (confirmed == last_word and now - last_time < COOLDOWN_SECONDS) and confirmed not in sentence_words:
                     sentence_words.append(confirmed)
                     last_word = confirmed
                     last_time = now
