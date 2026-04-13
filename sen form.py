@@ -12,20 +12,30 @@ import time
 from collections import deque
 
 # ══════════════════════════════════════════════════════
-GEMINI_API_KEY = ""
+GEMINI_API_KEY = "AIzaSyBtKU4kDd-Xb2gWhDvOkpvut5Bp6oGXsss"
 # ══════════════════════════════════════════════════════
 
-_llm_available = False
-_gemini_model  = None
+# ── Gemini async setup ────────────────────────────────
+# Gemini runs in a background thread so it NEVER blocks the camera feed.
+# When words change, we instantly show fallback grammar and fire a thread.
+# When thread finishes (~1-2s), result appears on screen automatically.
+# Same word combo is never sent to Gemini twice (cached).
+_llm_available    = False
+_gemini_model     = None
+_grammar_cache    = {}       # {tuple(words): sentence}  — persists forever
+_pending_llm_keys = set()   # keys currently being fetched
+_llm_lock         = threading.Lock()
+
 if GEMINI_API_KEY:
     try:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
-        _gemini_model  = genai.GenerativeModel("gemini-1.5-flash")
+        _gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        _gemini_model.generate_content("Say OK")   # connectivity test
         _llm_available = True
         print("Gemini LLM connected")
     except Exception as e:
-        print(f"Gemini failed: {e}")
+        print(f"Gemini failed: {e} — using fallback grammar")
 
 # ── PositionalEncoding ────────────────────────────────
 class PositionalEncoding(tf.keras.layers.Layer):
@@ -41,16 +51,25 @@ class PositionalEncoding(tf.keras.layers.Layer):
         return x + self.pe
 
 # ── Config ────────────────────────────────────────────
+# 8 classes — "nothing" removed, retrained
 GESTURES             = ["hello", "thanks", "yes", "no", "i", "fine", "please", "sorry"]
 SEQUENCE_LENGTH      = 30
 INPUT_SIZE           = 150
 CONFIDENCE_THRESHOLD = 0.92
-ENTROPY_THRESHOLD    = 1.8
+ENTROPY_THRESHOLD    = 1.6    # tighter since no idle "nothing" class
 STABLE_FRAMES        = 8
 COOLDOWN_SECONDS     = 2.5
 MAX_SENTENCE_LEN     = 12
 FACE_LANDMARKS       = [1, 152, 33, 263, 61, 291]
 POSE_LANDMARKS       = [0,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28]
+
+# Window layout
+WIN_W    = 860
+WIN_H    = 480
+PANEL_W  = 200    # right confidence panel
+CAM_W    = WIN_W - PANEL_W
+TOP_H    = 58
+BOT_H    = 115
 
 # ── Load model ────────────────────────────────────────
 print("Loading model...")
@@ -58,7 +77,7 @@ model      = None
 model_name = "none"
 
 for fpath, mname in [("models/sign_transformer_v1.h5", "Transformer"),
-                     ("models/sign_lstm_v2.h5", "LSTM")]:
+                     ("models/sign_lstm_v2.h5",        "LSTM")]:
     if not os.path.exists(fpath):
         continue
     try:
@@ -76,11 +95,12 @@ if model is None:
     exit()
 
 if model.output_shape[-1] != len(GESTURES):
-    print(f"ERROR: Model has {model.output_shape[-1]} outputs but need {len(GESTURES)}")
+    print(f"ERROR: Model outputs {model.output_shape[-1]} classes but GESTURES has {len(GESTURES)}.")
+    print(f"Your GESTURES list must exactly match what you trained on.")
     input("Press Enter to exit...")
     exit()
 
-print(f"Model OK — {model_name}")
+print(f"Model OK — {model_name} — {len(GESTURES)} classes")
 
 # ── MediaPipe ─────────────────────────────────────────
 print("Loading MediaPipe...")
@@ -93,8 +113,7 @@ hands = mp_hands.Hands(max_num_hands=1,
                        min_detection_confidence=0.7,
                        min_tracking_confidence=0.7)
 pose  = mp_pose.Pose(min_detection_confidence=0.7,
-                     min_tracking_confidence=0.7,
-                     model_complexity=0)
+                     min_tracking_confidence=0.7)
 face  = mp_face.FaceMesh(max_num_faces=1,
                           min_detection_confidence=0.7,
                           refine_landmarks=False)
@@ -103,8 +122,8 @@ print("MediaPipe OK")
 # ── Camera ────────────────────────────────────────────
 print("Opening camera...")
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIN_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WIN_H)
 if not cap.isOpened():
     print("ERROR: Cannot open camera.")
     input("Press Enter to exit...")
@@ -113,7 +132,7 @@ print("Camera OK — warming up...")
 for _ in range(25):
     cap.read()
 
-# ── Pygame ────────────────────────────────────────────
+# ── Pygame audio ──────────────────────────────────────
 pygame.mixer.init()
 _speaking = False
 
@@ -156,6 +175,10 @@ def extract_keypoints(hr, pr, fr):
                         for i in FACE_LANDMARKS]).flatten() \
               if fl else np.zeros(len(FACE_LANDMARKS) * 3)
     kp = np.concatenate([hand_kp, pose_kp, face_kp])
+
+    if np.max(kp) != 0:
+        kp = kp - np.mean(kp)
+        kp = kp / (np.std(kp) + 1e-6)
     if np.isnan(kp).any() or np.isinf(kp).any():
         kp = np.zeros_like(kp)
     return kp
@@ -165,177 +188,220 @@ def calc_entropy(probs):
     return float(-np.sum(p * np.log(p)))
 
 # ── Grammar ───────────────────────────────────────────
-# Cache key = tuple so it's hashable and updates when words change
-_grammar_cache = {}
+def _llm_thread(key):
+    try:
+        prompt = (
+            "Convert these sign language words into one short natural English sentence. "
+            "Return ONLY the sentence. No explanation.\n"
+            f"Words: {', '.join(key)}"
+        )
+        result = _gemini_model.generate_content(prompt).text.strip()
+        if result:
+            with _llm_lock:
+                _grammar_cache[key] = result
+    except Exception as e:
+        print(f"LLM error: {e}")
 
 def make_sentence(words):
     if not words:
         return "..."
-    key = tuple(words)                      # tuple so list changes invalidate cache
-    if key in _grammar_cache:
-        return _grammar_cache[key]
+    key = tuple(w.lower() for w in words)
+    with _llm_lock:
+        if key in _grammar_cache:
+            return _grammar_cache[key]
+    if _llm_available and key not in _pending_llm_keys:
+        _pending_llm_keys.add(key)
+        threading.Thread(target=_llm_thread, args=(key,), daemon=True).start()
+    return _fallback(words)
 
-    if _llm_available:
-        try:
-            prompt = (
-                "Convert these sign language detected words into ONE short natural English sentence. "
-                "Do not add extra words. Return ONLY the sentence, no explanation.\n"
-                f"Words: {', '.join(words)}"
-            )
-            result = _gemini_model.generate_content(prompt).text.strip()
-            if result:
-                _grammar_cache[key] = result
-                return result
-        except Exception as e:
-            print(f"LLM error: {e}")
-
-    # Rule-based fallback
+def _fallback(words):
     fixes = {
-        ("i", "fine")           : "I am fine.",
-        ("i", "sorry")          : "I am sorry.",
-        ("yes", "please")       : "Yes, please.",
-        ("no", "thanks")        : "No, thank you.",
-        ("hello", "i", "fine")  : "Hello! I am fine.",
-        ("i", "yes")            : "Yes, I do.",
-        ("i", "no")             : "No, I don't.",
-        ("hello", "thanks")     : "Hello, thank you.",
-        ("please", "help")      : "Please help me.",
-        ("i", "please")         : "I would like that, please.",
-        ("sorry", "yes")        : "Yes, sorry.",
-        ("sorry", "no")         : "No, sorry.",
-        ("yes", "i", "fine")    : "Yes, I am fine.",
-        ("no", "i", "fine")    : "No, I am not fine.",
+        ("i","fine")         : "I am fine.",
+        ("i","sorry")        : "I am sorry.",
+        ("yes","please")     : "Yes, please.",
+        ("no","thanks")      : "No, thank you.",
+        ("hello","i","fine") : "Hello! I am fine.",
+        ("i","yes")          : "Yes, I do.",
+        ("i","no")           : "No, I don't.",
+        ("hello","thanks")   : "Hello, thank you.",
+        ("i","please")       : "I would like that, please.",
+        ("sorry","yes")      : "Yes, sorry about that.",
+        ("sorry","no")       : "No, I am sorry.",
+        ("yes","i","fine")   : "Yes, I am fine.",
+        ("hello","yes")      : "Hello! Yes.",
+        ("hello","no")       : "Hello. No.",
+        ("yes","thanks")     : "Yes, thank you.",
+        ("no","sorry")       : "No, sorry.",
+        ("hello","please")   : "Hello, please help me.",
     }
     k = tuple(w.lower() for w in words)
     if k in fixes:
-        result = fixes[k]
-        _grammar_cache[key] = result
-        return result
-
-    result = words[0].capitalize()
+        return fixes[k]
+    r = words[0].capitalize()
     if len(words) > 1:
-        result += " " + " ".join(words[1:])
-    result = result.rstrip(".") + "."
-    _grammar_cache[key] = result
-    return result
+        r += " " + " ".join(words[1:])
+    return r.rstrip(".") + "."
 
-# ── Draw confidence bars (right side panel) ───────────
-def draw_bars(frame, probs):
-    h, w     = frame.shape[:2]
-    panel_x  = w - 190
-    max_bar  = 170
-    bar_h    = 16
-    spacing  = max(1, (h - 70) // len(GESTURES))
-    top_i    = int(np.argmax(probs))
+# ── Duplicate detection ───────────────────────────────
+# Blocks:  same word held too long (cooldown)
+#          same word as the very last word just added (consecutive)
+# Allows:  same word appearing earlier in sentence ("yes i yes" is valid)
+def is_duplicate(confirmed, sentence_words, last_word, last_time):
+    if confirmed == last_word and time.time() - last_time < COOLDOWN_SECONDS:
+        return True
+    if sentence_words and sentence_words[-1] == confirmed:
+        return True
+    return False
 
-    # dark background panel
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (panel_x - 5, 5), (w - 2, h - 5), (18, 18, 18), -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+# ── UI drawing ────────────────────────────────────────
+def draw_panel(frame, probs):
+    px    = WIN_W - PANEL_W + 6
+    maxbw = PANEL_W - 14
+    bar_h = 20
+    top_i = int(np.argmax(probs))
+    gap   = max(bar_h + 5, (WIN_H - TOP_H - 16) // len(GESTURES))
 
-    # header
-    cv2.putText(frame, f"Model: {model_name}", (panel_x, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (150, 150, 150), 1)
-    cv2.putText(frame, "Confidence", (panel_x, 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (150, 150, 150), 1)
+    ov = frame.copy()
+    cv2.rectangle(ov, (WIN_W - PANEL_W, 0), (WIN_W, WIN_H), (14, 16, 20), -1)
+    cv2.addWeighted(ov, 0.88, frame, 0.12, 0, frame)
+    cv2.line(frame, (WIN_W - PANEL_W, 0), (WIN_W - PANEL_W, WIN_H), (42, 48, 58), 1)
 
-    for i, (gesture, prob) in enumerate(zip(GESTURES, probs)):
-        y  = 45 + i * spacing
-        bw = int(prob * max_bar)
+    cv2.putText(frame, model_name.upper(), (px, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 130), 1)
+    cv2.putText(frame, "CONFIDENCE", (px, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (60, 72, 88), 1)
+    cv2.line(frame, (WIN_W - PANEL_W + 4, 42), (WIN_W - 4, 42), (38, 44, 54), 1)
 
-        if i == top_i and prob >= CONFIDENCE_THRESHOLD:
-            col = (50, 220, 80)    # green — accepted
-        elif i == top_i:
-            col = (30, 140, 255)   # blue — top but not confident enough
+    for i, (g, p) in enumerate(zip(GESTURES, probs)):
+        y  = TOP_H + 8 + i * gap
+        bw = int(p * maxbw)
+        is_top = (i == top_i)
+        ok     = is_top and p >= CONFIDENCE_THRESHOLD
+
+        if ok:
+            bc, tc, lc = (0, 185, 110), (190, 255, 215), (100, 200, 150)
+        elif is_top:
+            bc, tc, lc = (0, 110, 210), (140, 185, 255), (90, 140, 200)
         else:
-            col = (65, 85, 105)    # grey — other
+            bc, tc, lc = (38, 46, 58), (85, 96, 112), (60, 72, 88)
 
-        # background track
-        cv2.rectangle(frame, (panel_x, y), (panel_x + max_bar, y + bar_h), (38, 38, 38), -1)
-        # filled bar
-        if bw > 0:
-            cv2.rectangle(frame, (panel_x, y), (panel_x + bw, y + bar_h), col, -1)
-        # label
-        label = f"{gesture[:7]:<7s} {prob:.2f}"
-        txt_col = (255, 255, 255) if bw > 28 else (160, 160, 160)
-        cv2.putText(frame, label, (panel_x + 2, y + 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, txt_col, 1)
+        cv2.rectangle(frame, (px, y),       (px + maxbw, y + bar_h), (26, 30, 36), -1)
+        cv2.rectangle(frame, (px, y),       (px + maxbw, y + bar_h), (38, 44, 54), 1)
+        if bw > 1:
+            cv2.rectangle(frame, (px, y),   (px + bw,    y + bar_h), bc, -1)
 
-# ── Main UI overlay ───────────────────────────────────
-def draw_ui(frame, words, cur_word, conf, ent, speaking, hand_vis, probs):
-    h, w = frame.shape[:2]
-    panel_x = w - 190
+        cv2.putText(frame, g.upper(), (px + 3, y + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, lc, 1)
+        pct = f"{p*100:.0f}%"
+        (pw, _), _ = cv2.getTextSize(pct, cv2.FONT_HERSHEY_SIMPLEX, 0.33, 1)
+        cv2.putText(frame, pct, (px + maxbw - pw - 2, y + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, tc, 1)
 
-    draw_bars(frame, probs)
 
-    # ── top detection bar ──
-    cv2.rectangle(frame, (0, 0), (panel_x - 8, 58), (28, 28, 28), -1)
+def draw_top(frame, cur_word, conf, ent, hand_vis):
+    cv2.rectangle(frame, (0, 0), (CAM_W - 1, TOP_H), (17, 19, 23), -1)
+    cv2.line(frame,      (0, TOP_H), (CAM_W, TOP_H),  (38, 44, 54), 1)
 
     if not hand_vis:
-        msg = "  Show your hand to begin"
-        col = (110, 110, 110)
-    elif cur_word:
-        col = (50, 220, 80) if conf >= CONFIDENCE_THRESHOLD else (30, 140, 255)
-        msg = f"  Detecting: {cur_word.upper()}   conf: {conf:.2f}   entropy: {ent:.2f}"
+        cv2.putText(frame, "Show your hand to begin",
+                    (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 72, 88), 1)
+        cv2.putText(frame, "Waiting for hand detection...",
+                    (14, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (45, 55, 68), 1)
+        return
+
+    if cur_word:
+        col = (0, 215, 120) if conf >= CONFIDENCE_THRESHOLD else (0, 140, 230)
+        cv2.putText(frame, cur_word.upper(), (14, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.78, col, 2)
+        # confidence fill bar
+        by = 40
+        cv2.rectangle(frame, (14, by), (CAM_W - 16, by + 8), (32, 38, 46), -1)
+        fw = int((CAM_W - 30) * min(conf, 1.0))
+        fc = (0, 195, 110) if conf >= CONFIDENCE_THRESHOLD else (0, 120, 200)
+        cv2.rectangle(frame, (14, by), (14 + fw, by + 8), fc, -1)
+        cv2.putText(frame, f"conf {conf:.2f}   entropy {ent:.2f}",
+                    (14, by + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (65, 80, 100), 1)
     else:
-        col = (30, 140, 255)
         if ent > ENTROPY_THRESHOLD:
-            msg = f"  Uncertain (H={ent:.2f}) — unknown gesture"
+            cv2.putText(frame, "Unknown gesture",
+                        (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (45, 90, 155), 1)
+            cv2.putText(frame, f"H={ent:.2f} exceeds threshold — not a trained sign",
+                        (14, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (45, 65, 100), 1)
         else:
-            msg = f"  Confidence too low ({conf:.2f}) — hold gesture steady"
+            cv2.putText(frame, "Hold gesture steady",
+                        (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (55, 75, 105), 1)
+            cv2.putText(frame, f"conf {conf:.2f} below {CONFIDENCE_THRESHOLD} threshold",
+                        (14, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (45, 60, 90), 1)
 
-    cv2.putText(frame, msg, (8, 38),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, col, 2)
 
-    # ── bottom sentence bar ──
-    cv2.rectangle(frame, (0, h - 120), (panel_x - 8, h), (22, 22, 22), -1)
+def draw_bottom(frame, words, speaking):
+    bt = WIN_H - BOT_H
+    cv2.rectangle(frame, (0, bt), (CAM_W - 1, WIN_H), (17, 19, 23), -1)
+    cv2.line(frame,      (0, bt), (CAM_W, bt),         (38, 44, 54), 1)
 
-    sentence = make_sentence(words)
+    cv2.putText(frame, "SENTENCE", (12, bt + 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (48, 58, 72), 1)
 
-    cv2.putText(frame, "Sentence:", (10, h - 95),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (130, 130, 130), 1)
+    sentence  = make_sentence(words)
+    max_chars = 42
 
-    # wrap long sentences
-    max_chars = 38
     if len(sentence) > max_chars:
-        mid = sentence.rfind(" ", 0, max_chars)
-        if mid == -1:
-            mid = max_chars
-        line1 = sentence[:mid]
-        line2 = sentence[mid:].strip()
-        cv2.putText(frame, line1, (10, h - 72),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
-        cv2.putText(frame, line2, (10, h - 46),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+        split = sentence.rfind(" ", 0, max_chars)
+        split = split if split != -1 else max_chars
+        cv2.putText(frame, sentence[:split], (12, bt + 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.68, (225, 230, 242), 2)
+        cv2.putText(frame, sentence[split:].strip(), (12, bt + 62),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.68, (225, 230, 242), 2)
     else:
-        cv2.putText(frame, sentence, (10, h - 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.82, (255, 255, 255), 2)
+        cv2.putText(frame, sentence, (12, bt + 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (225, 230, 242), 2)
 
-    # ── word pills ──
-    x = 10
+    # word pills
+    px, py1, py2 = 12, WIN_H - 36, WIN_H - 17
     for word in words:
-        sz  = cv2.getTextSize(word, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)[0]
-        pw  = sz[0] + 14
-        if x + pw < panel_x - 15:
-            cv2.rectangle(frame, (x, h - 28), (x + pw, h - 10), (50, 72, 95), -1)
-            cv2.putText(frame, word, (x + 6, h - 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (190, 215, 255), 1)
-            x += pw + 6
+        (tw, _), _ = cv2.getTextSize(word, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        pw = tw + 14
+        if px + pw > CAM_W - 18:
+            break
+        cv2.rectangle(frame, (px, py1), (px + pw, py2), (35, 52, 74), -1)
+        cv2.rectangle(frame, (px, py1), (px + pw, py2), (52, 76, 108), 1)
+        cv2.putText(frame, word, (px + 6, py2 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 195, 240), 1)
+        px += pw + 5
 
-    # ── hints ──
-    llm_txt = "LLM:ON" if _llm_available else "LLM:OFF"
-    llm_col = (50, 220, 80) if _llm_available else (110, 110, 110)
-    cv2.putText(frame, llm_txt, (10, h - 1),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.37, llm_col, 1)
+    # hints + status
+    hy = WIN_H - 4
+    if speaking:
+        cv2.putText(frame, "Speaking...", (12, hy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 195, 110), 1)
+    else:
+        hx = 12
+        for k, a in [("SPC","speak"),("C","clear"),("BKSP","undo"),("Q","quit")]:
+            cv2.putText(frame, k, (hx, hy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 165, 100), 1)
+            (kw,_),_ = cv2.getTextSize(k, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+            hx += kw + 1
+            cv2.putText(frame, f"={a}  ", (hx, hy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, (50, 62, 78), 1)
+            (aw,_),_ = cv2.getTextSize(f"={a}  ", cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+            hx += aw
 
-    hint = "Speaking..." if speaking else \
-           "SPACE=speak  C=clear  BKSP=undo  Q=quit"
-    cv2.putText(frame, hint, (75, h - 1),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.37, (90, 190, 255), 1)
+    llm = "LLM:ON" if _llm_available else "LLM:OFF"
+    lc  = (0, 170, 105) if _llm_available else (70, 82, 98)
+    (lw,_),_ = cv2.getTextSize(llm, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+    cv2.putText(frame, llm, (CAM_W - lw - 55, hy),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34, lc, 1)
+    wc = f"{len(words)}/{MAX_SENTENCE_LEN}"
+    (ww,_),_ = cv2.getTextSize(wc, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+    cv2.putText(frame, wc, (CAM_W - ww - 6, hy),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (55, 66, 82), 1)
 
-    cv2.putText(frame, f"{len(words)}/{MAX_SENTENCE_LEN}",
-                (panel_x - 58, h - 1),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.37, (130, 130, 130), 1)
+
+def render(frame, words, cur_word, conf, ent, speaking, hand_vis, probs):
+    draw_panel(frame, probs)
+    draw_top(frame, cur_word, conf, ent, hand_vis)
+    draw_bottom(frame, words, speaking)
+    return frame
 
 # ── State ─────────────────────────────────────────────
 sequence       = []
@@ -348,8 +414,8 @@ conf_disp      = 0.0
 ent_disp       = 0.0
 probs_disp     = np.zeros(len(GESTURES))
 
-print("\nReady!")
-print("Controls: SPACE=speak | C=clear | BACKSPACE=undo last word | Q=quit\n")
+print(f"\nReady! ({WIN_W}x{WIN_H})")
+print("SPACE=speak | C=clear | BACKSPACE=undo | Q=quit\n")
 
 # ══════════════════════════════════════════════════════
 #  MAIN LOOP
@@ -358,6 +424,8 @@ while True:
     ret, frame = cap.read()
     if not ret or frame is None:
         continue
+
+    frame = cv2.resize(frame, (WIN_W, WIN_H))
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     rgb.flags.writeable = False
@@ -368,17 +436,17 @@ while True:
 
     hand_vis = hr.multi_hand_landmarks is not None
 
-    # landmarks
     if hr.multi_hand_landmarks:
         mp_draw.draw_landmarks(frame,
                                hr.multi_hand_landmarks[0],
-                               mp_hands.HAND_CONNECTIONS)
+                               mp_hands.HAND_CONNECTIONS,
+                               mp_draw.DrawingSpec(color=(0,195,115), thickness=2, circle_radius=3),
+                               mp_draw.DrawingSpec(color=(0,140,82),  thickness=1, circle_radius=1))
     if pr.pose_landmarks:
         mp_draw.draw_landmarks(frame, pr.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                               mp_draw.DrawingSpec(color=(80,110,10), thickness=1, circle_radius=1),
-                               mp_draw.DrawingSpec(color=(80,240,121), thickness=1, circle_radius=1))
+                               mp_draw.DrawingSpec(color=(35,70,52),  thickness=1, circle_radius=1),
+                               mp_draw.DrawingSpec(color=(52,110,78), thickness=1, circle_radius=1))
 
-    # buffer
     kp = extract_keypoints(hr, pr, fr)
     sequence.append(kp)
     sequence = sequence[-SEQUENCE_LENGTH:]
@@ -392,78 +460,72 @@ while True:
 
     elif len(sequence) == SEQUENCE_LENGTH:
         try:
-            inp       = np.expand_dims(np.array(sequence, dtype=np.float32), 0)
-            preds     = model.predict(inp, verbose=0)[0]
-            conf_disp = float(np.max(preds))
-            ent_disp  = calc_entropy(preds)
+            inp        = np.expand_dims(np.array(sequence, dtype=np.float32), 0)
+            preds      = model.predict(inp, verbose=0)[0]
+            conf_disp  = float(np.max(preds))
+            ent_disp   = calc_entropy(preds)
             probs_disp = preds
-            predicted = GESTURES[np.argmax(preds)]
+            predicted  = GESTURES[np.argmax(preds)]
 
-            # reject if: nothing class, low confidence, OR high entropy
-            if (predicted == "nothing"
-                    or conf_disp < CONFIDENCE_THRESHOLD
-                    or ent_disp > ENTROPY_THRESHOLD):
+            if conf_disp < CONFIDENCE_THRESHOLD or ent_disp > ENTROPY_THRESHOLD:
                 cur_word = ""
                 stable_buf.append("")
             else:
                 cur_word = predicted
                 stable_buf.append(predicted)
 
-            # only add word after STABLE_FRAMES consecutive identical predictions
             if (len(stable_buf) == STABLE_FRAMES
                     and len(set(stable_buf)) == 1
                     and stable_buf[0] != ""
                     and len(sentence_words) < MAX_SENTENCE_LEN):
 
                 confirmed = stable_buf[0]
-                now = time.time()
-
-                # cooldown prevents same word repeating too fast, and prevent duplicates entirely
-                if not (confirmed == last_word and now - last_time < COOLDOWN_SECONDS) and confirmed not in sentence_words:
+                if not is_duplicate(confirmed, sentence_words, last_word, last_time):
                     sentence_words.append(confirmed)
                     last_word = confirmed
-                    last_time = now
-                    stable_buf.clear()        # clear so next word needs fresh 8 frames
+                    last_time = time.time()
+                    stable_buf.clear()
+                    # pre-warm LLM for new combo
+                    if _llm_available:
+                        k = tuple(w.lower() for w in sentence_words)
+                        if k not in _grammar_cache and k not in _pending_llm_keys:
+                            _pending_llm_keys.add(k)
+                            threading.Thread(target=_llm_thread, args=(k,), daemon=True).start()
                     print(f"  Added: '{confirmed}' → {sentence_words}")
 
         except Exception as e:
             print(f"Prediction error: {e}")
             sequence.clear()
 
-    draw_ui(frame, sentence_words, cur_word, conf_disp, ent_disp,
-            _speaking, hand_vis, probs_disp)
+    render(frame, sentence_words, cur_word, conf_disp, ent_disp,
+           _speaking, hand_vis, probs_disp)
 
-    cv2.imshow("Sign Language Interpreter", frame)
+    cv2.imshow("SignBridge", frame)
 
     key = cv2.waitKey(1) & 0xFF
 
     if key == ord("q"):
         break
-
     elif key == ord(" "):
         if sentence_words:
             final = make_sentence(sentence_words)
             print(f"Speaking: '{final}'")
             speak(final)
-        else:
-            print("Nothing to speak yet.")
-
     elif key == ord("c"):
         sentence_words.clear()
         stable_buf.clear()
         sequence.clear()
-        last_word = ""
-        last_time = 0.0
-        cur_word  = ""
-        _grammar_cache.clear()
+        last_word = ""; last_time = 0.0; cur_word = ""
+        with _llm_lock:
+            _grammar_cache.clear()
+        _pending_llm_keys.clear()
         probs_disp = np.zeros(len(GESTURES))
         print("Cleared.")
-
-    elif key == 8:   # BACKSPACE
+    elif key == 8:
         if sentence_words:
             removed = sentence_words.pop()
-            # invalidate cache for old sentence
-            _grammar_cache.clear()
+            with _llm_lock:
+                _grammar_cache.clear()
             print(f"Removed: '{removed}' → {sentence_words}")
 
 # ── Cleanup ───────────────────────────────────────────
