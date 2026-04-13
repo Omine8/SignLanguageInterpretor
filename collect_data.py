@@ -17,15 +17,17 @@ face  = mp_face.FaceMesh(max_num_faces=1,
                          refine_landmarks=False)
 
 # ─── CONFIG ──────────────────────────────────────────
-# GESTURES = ["hello", "thanks", "yes", "no", "i", "fine", "please", "sorry"]
-import sys
+# GESTURES = ["hello", "thanks", "yes", "no", "i", "fine", "please", "sorry", "need"]
+GESTURES =["need"]
 
-if len(sys.argv) > 1:
-    GESTURES = [sys.argv[1]]
-else:
-    GESTURES = ["hello", "thanks", "yes", "no", "i", "fine", "please", "sorry"]
+# import sys
+
+# if len(sys.argv) > 1:
+#     GESTURES = [sys.argv[1]]
+# else:
+#     GESTURES = ["hello", "thanks", "yes", "no", "i", "fine", "please", "sorry"]
 SEQUENCE_LENGTH     = 30
-SAMPLES_PER_GESTURE = 1
+SAMPLES_PER_GESTURE = 30
 DATA_PATH           = "data_v2"
 
 FACE_LANDMARKS = [1, 152, 33, 263, 61, 291]

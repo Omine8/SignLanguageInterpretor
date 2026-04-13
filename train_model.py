@@ -1,21 +1,3 @@
-"""
-train_model.py  —  Temporal Transformer for Sign Language Recognition
-======================================================================
-WHAT CHANGED FROM YOUR OLD FILE:
-- Replaced 3-stacked LSTM with a Temporal Transformer (self-attention)
-- Added Positional Encoding so the model understands frame order
-- Added learning-rate warmup scheduler (standard in Transformer training)
-- Saves BOTH the new transformer model AND keeps old LSTM for comparison
-- Prints a clean accuracy comparison at the end
-
-WHY TRANSFORMER > LSTM:
-- LSTM processes frames one-by-one (sequential) → slow, forgets early frames
-- Transformer looks at ALL 30 frames simultaneously via self-attention
-- Self-attention lets the model learn "frame 5 and frame 28 are related"
-  which is impossible for an LSTM to do efficiently
-- Used in modern sign language research papers (2022–2024)
-"""
-
 import numpy as np
 import os
 import tensorflow as tf
@@ -35,15 +17,14 @@ matplotlib.use("Agg")           # headless — no display needed
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-# ⚠️  ORDER MUST MATCH sen_form.py EXACTLY — do not change
-GESTURES        = ["hello", "thanks", "yes", "no", "i", "fine", "please", "sorry"]
+
+GESTURES        = ["hello", "thanks", "yes", "i", "fine", "please", "sorry", "need"]
 DATA_PATH       = "data_v2"
 SEQUENCE_LENGTH = 30
 INPUT_SIZE      = 150   # 63 hand + 69 pose + 18 face
 NUM_CLASSES     = len(GESTURES)
 
-# ─── LOAD DATA ────────────────────────────────────────────────────────────────
+
 print("=" * 55)
 print("  Loading dataset...")
 print("=" * 55)
@@ -80,7 +61,7 @@ X_train, X_test, y_train, y_test = train_test_split(
 
 print(f"  Train: {len(X_train)}  |  Test: {len(X_test)}")
 
-# ─── POSITIONAL ENCODING ──────────────────────────────────────────────────────
+
 class PositionalEncoding(tf.keras.layers.Layer):
     """
     Injects information about POSITION of each frame into the model.
@@ -95,43 +76,20 @@ class PositionalEncoding(tf.keras.layers.Layer):
     """
     def __init__(self, max_len=30, d_model=150, **kwargs):
         super().__init__(**kwargs)
-        # Build the positional encoding matrix once
-        positions = np.arange(max_len)[:, np.newaxis]          # (30, 1)
-        dims      = np.arange(d_model)[np.newaxis, :]          # (1, 150)
-        # Sine for even indices, cosine for odd indices
+        
+        positions = np.arange(max_len)[:, np.newaxis]          
+        dims      = np.arange(d_model)[np.newaxis, :]      
         angles    = positions / np.power(10000, (2 * (dims // 2)) / d_model)
         angles[:, 0::2] = np.sin(angles[:, 0::2])
         angles[:, 1::2] = np.cos(angles[:, 1::2])
-        # Store as non-trainable constant
-        self.pe = tf.cast(angles[np.newaxis, :, :], tf.float32)  # (1, 30, 150)
+        self.pe = tf.cast(angles[np.newaxis, :, :], tf.float32)
 
     def call(self, x):
-        return x + self.pe   # broadcast adds position info to every sample
+        return x + self.pe
 
 
-# ─── TRANSFORMER ENCODER BLOCK ────────────────────────────────────────────────
 def transformer_encoder_block(x, num_heads, ff_dim, dropout_rate=0.1):
-    """
-    One Transformer Encoder block. Your model stacks 2 of these.
-
-    Inside each block:
-    1. Multi-Head Self-Attention
-       → Every frame "looks at" all other frames and decides which ones matter
-       → num_heads=4 means 4 parallel attention patterns (e.g. one head
-          might focus on wrist position, another on finger spread)
-
-    2. Add & Norm (residual connection)
-       → Adds the original input back so gradients flow easily (avoids vanishing)
-
-    3. Feed-Forward Network
-       → Two Dense layers to process the attention output
-       → ff_dim=256 is the hidden size of this mini-network
-
-    4. Add & Norm again
-
-    This is the standard Transformer encoder from "Attention Is All You Need" (Vaswani 2017).
-    """
-    # — Self-Attention —
+    
     attn_out = MultiHeadAttention(
         num_heads=num_heads,
         key_dim=INPUT_SIZE // num_heads,  # 150 / 4 = 37 per head
@@ -154,25 +112,8 @@ def transformer_encoder_block(x, num_heads, ff_dim, dropout_rate=0.1):
     return x
 
 
-# ─── BUILD TRANSFORMER MODEL ──────────────────────────────────────────────────
 def build_transformer():
-    """
-    Full architecture:
-
-    Input (30, 150)
-        │
-    PositionalEncoding      ← tells model about frame order
-        │
-    TransformerBlock × 2    ← self-attention over all 30 frames
-        │
-    GlobalAveragePooling1D  ← collapses 30 frames → 1 vector
-        │
-    Dense(128, relu)
-    Dropout(0.3)
-    Dense(64, relu)
-        │
-    Dense(9, softmax)       ← one probability per gesture
-    """
+    
     inputs = Input(shape=(SEQUENCE_LENGTH, INPUT_SIZE), name="frame_sequence")
 
     # Add positional info
@@ -197,16 +138,6 @@ def build_transformer():
 
 # ─── LEARNING RATE WARMUP ─────────────────────────────────────────────────────
 class WarmupCosineSchedule(tf.keras.callbacks.Callback):
-    """
-    Learning rate schedule specifically designed for Transformers.
-
-    - Warmup phase (first 10 epochs): LR gradually increases from 0 → peak
-      Why: Transformer attention weights are random at start; big LR early
-           causes chaotic updates. Warming up stabilizes early training.
-
-    - Cosine decay (remaining epochs): LR smoothly decreases
-      Why: Fine-tunes the model without overshooting the minimum.
-    """
     def __init__(self, warmup_epochs=10, total_epochs=100, peak_lr=1e-3):
         super().__init__()
         self.warmup_epochs = warmup_epochs

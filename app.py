@@ -32,7 +32,7 @@ import cv2
 # ══════════════════════════════════════════════════════
 #  CONFIG  (mirrors sen_form.py exactly)
 # ══════════════════════════════════════════════════════
-GESTURES             = ["hello", "thanks", "yes", "no", "i", "fine", "please", "sorry", "need"]
+GESTURES             = ["hello", "thanks", "yes", "i", "fine", "please", "sorry", "need"]
 SEQUENCE_LENGTH      = 30
 INPUT_SIZE           = 150
 CONFIDENCE_THRESHOLD = 0.92

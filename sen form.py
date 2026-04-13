@@ -52,11 +52,11 @@ class PositionalEncoding(tf.keras.layers.Layer):
 
 # ── Config ────────────────────────────────────────────
 # 8 classes — "nothing" removed, retrained
-GESTURES             = ["hello", "thanks", "yes", "no", "i", "fine", "please", "sorry"]
+GESTURES             = ["hello", "thanks", "yes", "i", "fine", "please", "sorry", "need"]
 SEQUENCE_LENGTH      = 30
 INPUT_SIZE           = 150
 CONFIDENCE_THRESHOLD = 0.92
-ENTROPY_THRESHOLD    = 1.6    # tighter since no idle "nothing" class
+ENTROPY_THRESHOLD    = 1.6    
 STABLE_FRAMES        = 8
 COOLDOWN_SECONDS     = 2.5
 MAX_SENTENCE_LEN     = 12
@@ -66,7 +66,7 @@ POSE_LANDMARKS       = [0,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,
 # Window layout
 WIN_W    = 860
 WIN_H    = 480
-PANEL_W  = 200    # right confidence panel
+PANEL_W  = 200   
 CAM_W    = WIN_W - PANEL_W
 TOP_H    = 58
 BOT_H    = 115
@@ -216,7 +216,9 @@ def make_sentence(words):
 
 def _fallback(words):
     fixes = {
+        # ── Existing ──
         ("i","fine")         : "I am fine.",
+        ("i", "no", "fine")  : "I am not fine.",
         ("i","sorry")        : "I am sorry.",
         ("yes","please")     : "Yes, please.",
         ("no","thanks")      : "No, thank you.",
@@ -233,19 +235,99 @@ def _fallback(words):
         ("yes","thanks")     : "Yes, thank you.",
         ("no","sorry")       : "No, sorry.",
         ("hello","please")   : "Hello, please help me.",
+        ("need","please")    : "I need your help, please.",
+        ("hello","need")     : "Hello, I need help.",
+        
+        # ── NEW: Negations ──
+        ("no", "fine")       : "I am not fine.",
+        ("no", "sorry")      : "No, I am sorry.",
+        ("no", "thanks")     : "No, I don't think so.",
+        ("no", "please")     : "No, thank you, please.",
+        
+        # ── NEW: Questions (inferred from gesture order) ──
+        ("yes", "need")      : "Do you need help?",
+        ("no", "need")       : "You don't need help.",
+        ("hello", "sorry")   : "Hello, I am sorry.",
+        ("hello", "fine")    : "Hello, I am fine.",
+        
+        # ── NEW: Multi-word phrases ──
+        ("sorry", "i", "fine")    : "Sorry, but I am fine.",
+        ("please", "i", "need")   : "Please, I need help.",
+        ("thanks", "i", "fine")   : "Thank you, I am fine.",
+        ("yes", "i", "sorry")     : "Yes, I am sorry.",
+        ("hello", "yes", "please"): "Hello! Yes, please.",
+        ("no", "i", "sorry")      : "No, I am sorry.",
+        ("need", "i", "please")   : "I need your help, please.",
+        ("i", "need", "please")   : "I need your help, please.",
+        ("please", "hello")       : "Hello, please help me.",
+        ("thank", "you", "please"): "Thank you, please.",  # if "thanks" gets split
+        
+        # ── NEW: Polite constructions ──
+        ("i", "thanks")      : "Thank you.",
+        ("thanks", "hello")  : "Hello, thank you.",
+        ("please", "yes")    : "Yes, please.",
+        ("please", "no")     : "No, thank you.",
+        
+        # ── NEW: Emphatic constructions ──
+        ("yes", "yes")       : "Yes, definitely!",
+        ("no", "no")         : "Absolutely not.",
+        ("hello", "hello")   : "Hello there!",
+        ("sorry", "sorry")   : "I am so sorry.",
+        
+        # ── NEW: Three-word combinations with "need" ──
+        ("i", "need", "sorry")    : "I am sorry, I need help.",
+        ("yes", "please", "need") : "Yes, I need that, please.",
+        ("hello", "please", "need"): "Hello, I need help, please.",
     }
+    
     k = tuple(w.lower() for w in words)
     if k in fixes:
         return fixes[k]
+    
+    # ── NEW: Smarter fallback with morphology ──
+    r = _construct_sentence(words)
+    return r
+
+def _construct_sentence(words):
+    """Smarter fallback: construct grammatical sentence based on word types."""
+    
+    # Define word categories
+    pronouns = {"i", "you", "we", "they", "he", "she"}
+    verbs = {"am", "is", "are", "need", "thanks"}
+    modifiers = {"sorry", "fine", "please"}
+    greetings = {"hello", "hi"}
+    confirmations = {"yes", "no"}
+    
+    w_lower = [wrd.lower() for wrd in words]
+    
+    # ── Case 1: Greeting + state ──
+    if any(w in greetings for w in w_lower) and any(w in modifiers for w in w_lower):
+        state = next((w for w in w_lower if w in modifiers), None)
+        return f"Hello, I am {state}."
+    
+    # ── Case 2: Pronoun + verb ──
+    if "i" in w_lower:
+        if "sorry" in w_lower:
+            return "I am sorry."
+        if "fine" in w_lower and "no" in w_lower:
+            return "I am not fine."
+        if "fine" in w_lower:
+            return "I am fine."
+        if "need" in w_lower:
+            return "I need help."
+    
+    # ── Case 3: Confirmation + politeness ──
+    if w_lower[0] in confirmations:
+        if "please" in w_lower:
+            return f"{words[0]}, please." if words[0].lower() == "yes" else f"{words[0]}, thank you."
+        return f"{words[0]}."
+    
+    # ── Case 4: Generic capitalization fallback ──
     r = words[0].capitalize()
     if len(words) > 1:
         r += " " + " ".join(words[1:])
     return r.rstrip(".") + "."
 
-# ── Duplicate detection ───────────────────────────────
-# Blocks:  same word held too long (cooldown)
-#          same word as the very last word just added (consecutive)
-# Allows:  same word appearing earlier in sentence ("yes i yes" is valid)
 def is_duplicate(confirmed, sentence_words, last_word, last_time):
     if confirmed == last_word and time.time() - last_time < COOLDOWN_SECONDS:
         return True
@@ -417,9 +499,6 @@ probs_disp     = np.zeros(len(GESTURES))
 print(f"\nReady! ({WIN_W}x{WIN_H})")
 print("SPACE=speak | C=clear | BACKSPACE=undo | Q=quit\n")
 
-# ══════════════════════════════════════════════════════
-#  MAIN LOOP
-# ══════════════════════════════════════════════════════
 while True:
     ret, frame = cap.read()
     if not ret or frame is None:
