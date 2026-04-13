@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sign Language AI</title>
+
+    <style>
+        body {
+            background: #0f172a;
+            color: white;
+            text-align: center;
+            font-family: Arial;
+        }
+
+        button {
+            padding: 12px;
+            margin: 10px;
+            background: #22c55e;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+
+        input {
+            padding: 10px;
+            border-radius: 6px;
+        }
+
+        #status {
+            margin-top: 15px;
+            color: cyan;
+        }
+    </style>
+</head>
+
+<body>
+
+<h1>Sign Language AI</h1>
+
+<img src="/video" width="600"/>
+
+<br>
+
+<button onclick="startDetection()">Start Detection</button>
+
+<br><br>
+
+<input id="gesture" placeholder="Gesture name">
+<button onclick="collect()">Collect Data</button>
+
+<br><br>
+
+<button onclick="train()">Train Model</button>
+
+<div id="status">Idle</div>
+
+<script>
+async function startDetection() {
+    let res = await fetch('/start_detection');
+    let data = await res.json();
+    document.getElementById("status").innerText = data.status;
+}
+
+async function collect() {
+    let gesture = document.getElementById("gesture").value;
+
+    let res = await fetch('/collect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({gesture})
+    });
+
+    let data = await res.json();
+    document.getElementById("status").innerText = data.status;
+}
+
+async function train() {
+    let res = await fetch('/train');
+    let data = await res.json();
+    document.getElementById("status").innerText = data.status;
+}
+</script>
+
+</body>
+</html>
